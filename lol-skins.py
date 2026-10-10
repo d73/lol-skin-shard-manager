@@ -7,6 +7,10 @@ self-contained HTML file.
 REQUIREMENTS
     - Windows, with the League Client (LeagueClientUx.exe) running and logged in
     - Python 3.8+, stdlib only (no pip installs needed)
+    - A Riot developer API key (required, command-line only - see USAGE).
+      Get one free from https://developer.riotgames.com/ (log in, copy the
+      "Development API Key" on your dashboard). It expires ~24h after being
+      generated, so you'll need a fresh one each day you run this.
 
 HOW IT WORKS
     Riot's public API does NOT expose skin ownership for any account - that
@@ -15,14 +19,22 @@ HOW IT WORKS
     the running client, reads its port + auth token off its own process
     command line, pulls your owned skins over that local API, and writes one
     HTML file with thumbnails embedded as base64 (so it still opens fine
-    after you close the client).
+    after you close the client). Play Rate/Win Rate come from Riot's
+    official match-v5 API instead (see --riot-api-key below), since the
+    LCU's own local match history only goes back ~200 games.
 
 USAGE
-    python Get-LoLSkins.py
-    python Get-LoLSkins.py --include-base       # also list free/default skins
-    python Get-LoLSkins.py --shards-only        # only champs with an available skin shard
-    python Get-LoLSkins.py --out C:\\temp\\skins.html
-    python Get-LoLSkins.py --no-open
+    --riot-api-key is REQUIRED on every run (no config file, no env var -
+    it must be passed on the command line each time):
+      python Get-LoLSkins.py --riot-api-key RGAPI-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    Get a key (free, valid ~24h) from https://developer.riotgames.com/ -
+    log in, then copy the "Development API Key" on your dashboard.
+
+    python Get-LoLSkins.py --riot-api-key RGAPI-xxx --include-base       # also list free/default skins
+    python Get-LoLSkins.py --riot-api-key RGAPI-xxx --shards-only        # only champs with an available skin shard
+    python Get-LoLSkins.py --riot-api-key RGAPI-xxx --out C:\\temp\\skins.html
+    python Get-LoLSkins.py --riot-api-key RGAPI-xxx --no-open
+    python Get-LoLSkins.py --riot-api-key RGAPI-xxx --cache-dir C:\\temp\\lol-match-cache  # custom cache location
 
 KNOWN WEAKNESSES (read before assuming this keeps working forever)
     - LCU endpoints are undocumented/unofficial. Riot can change them without
@@ -39,17 +51,27 @@ KNOWN WEAKNESSES (read before assuming this keeps working forever)
     - Skin shards are read from the loot API (type "CHAMPION_SKIN_RENTAL"),
       which is just as undocumented/unofficial as the rest of the LCU - if
       shard counts look wrong, check that type string first.
-    - Play Rate and Win Rate come from paging through the local
-      match-history API (fetch_match_history()), which has only ever been
-      observed to serve back ~200 games before returning an empty page,
-      regardless of how many games are actually on the account - this
-      looks like a hard ceiling on what the LCU caches locally, not
-      something this script can page past. Full career history would
-      require Riot's online Match-V5 API with a developer API key
-      instead, which this script intentionally does not use (it's
-      LCU-only, zero-setup by design). There's a 2000-game safety cap in
-      the code, but in practice the ~200-game server ceiling is hit first.
-      Win Rate additionally depends on a "win" field being present on the
+    - Play Rate and Win Rate normally come from Riot's official match-v5
+      API (fetch_full_match_history()), which needs --riot-api-key (see
+      USAGE/REQUIREMENTS) and goes back as far as Riot's backend has
+      match-v5 data indexed for that account - NOT guaranteed to be every
+      game ever played. Results are cached on disk per-account (by puuid,
+      under --cache-dir) so repeat runs only fetch new matches - delete
+      the account's cache file to force a full re-fetch. A free
+      "Development API Key" is rate-limited (roughly 20 req/sec, 100
+      req/2min, throttled here conservatively) and expires ~24h after
+      being generated, so a first run on an account with thousands of
+      games can take a long time and may need the key regenerated and the
+      run repeated; the platform->continent routing map
+      (PLATFORM_TO_CONTINENT) is also something Riot could change without
+      notice. If the key is rejected or a request fails outright at
+      runtime, this silently falls back to the local client's own
+      match-history API (fetch_match_history()) instead, which only goes
+      back ~200 games (a hard ceiling on what the LCU caches locally, not
+      something pagination can get past) - so a surprisingly low Play
+      Rate denominator usually means that fallback kicked in, not that
+      your real history is actually that short. Win Rate in that fallback
+      path additionally depends on a "win" field being present on the
       local player's participant entry (checked both flattened and nested
       under "stats") - if a client version drops that field, wins will
       undercount to zero without any other symptom.
@@ -62,17 +84,25 @@ import re
 import ssl
 import subprocess
 import sys
+import time
 import webbrowser
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
+RIOT_DEV_PORTAL_URL = "https://developer.riotgames.com/"
+
 
 def find_client():
-    """Return (port, token) parsed from the running LeagueClientUx.exe command line."""
+    """Return (port, token, region) parsed from the running
+    LeagueClientUx.exe command line. region is the client's own
+    "--region=" launch flag (e.g. "NA1") if present, else None - it's the
+    most reliable source for a real platform id, used for Riot API
+    continent routing.
+    """
     try:
         raw = subprocess.check_output(
             [
@@ -96,7 +126,9 @@ def find_client():
             "changed the launch flags - this is the first thing to check if the "
             "script stops working."
         )
-    return port_match.group(1), token_match.group(1)
+    region_match = re.search(r"--region=(\w+)", raw)
+    region = region_match.group(1) if region_match else None
+    return port_match.group(1), token_match.group(1), region
 
 
 class Lcu:
@@ -120,6 +152,255 @@ class Lcu:
         req = Request(self.base_url + path, headers=self.headers)
         with urlopen(req, context=self.ctx) as resp:
             return resp.read()
+
+
+def fetch_region_locale(lcu):
+    """Fallback-only region lookup, off an undocumented LCU endpoint - same
+    caveats as everything else in this file. Used only when the client's
+    own "--region=" launch flag (read in find_client(), a more reliable
+    source) isn't available. Confirmed by hand to return a short regional
+    code here (e.g. "NA") rather than a full platform id (e.g. "NA1") -
+    see SHORT_REGION_TO_CONTINENT below. Returns None on any
+    failure/unexpected shape so callers can fall back further.
+    """
+    try:
+        resp = lcu.get_json("/riotclient/region-locale")
+    except (URLError, HTTPError):
+        return None
+    return (resp or {}).get("region")
+
+
+# Riot's match-v5 API routes by continent, not platform - this is Riot's
+# documented platform -> continent grouping. If Riot adds/moves a platform
+# this will need updating. Keyed by the full platform id (e.g. "NA1"), as
+# read from the client's own "--region=" launch flag.
+PLATFORM_TO_CONTINENT = {
+    "NA1": "americas", "BR1": "americas", "LA1": "americas", "LA2": "americas", "OC1": "americas",
+    "EUW1": "europe", "EUN1": "europe", "TR1": "europe", "RU": "europe",
+    "KR": "asia", "JP1": "asia",
+    "PH2": "sea", "SG2": "sea", "TH2": "sea", "TW2": "sea", "VN2": "sea",
+}
+
+# Same continent grouping, but keyed by the shorter regional code the LCU's
+# /riotclient/region-locale endpoint returns instead (e.g. "NA" rather than
+# "NA1") - only used as a fallback when --region= wasn't on the command line.
+SHORT_REGION_TO_CONTINENT = {
+    "NA": "americas", "BR": "americas", "LAN": "americas", "LAS": "americas", "OCE": "americas",
+    "EUW": "europe", "EUNE": "europe", "TR": "europe", "RU": "europe",
+    "KR": "asia", "JP": "asia",
+    "PH": "sea", "SG": "sea", "TH": "sea", "TW": "sea", "VN": "sea",
+}
+
+
+class RiotApiError(Exception):
+    """Raised when the Riot API key is missing/invalid, or retries are exhausted."""
+
+
+class RiotApi:
+    """Thin client for Riot's public match-v5 API, with basic rate-limit
+    handling tuned for a personal/development API key.
+
+    KNOWN WEAKNESSES
+        - The throttle limits below are conservative guesses at a
+          Development API Key's published limits (~20 req/sec, 100
+          req/2min) - a production key has different (higher) limits that
+          aren't plumbed in here.
+        - On a 429 this sleeps for the server's Retry-After header, or 2s
+          if that header's missing, and retries a bounded number of times
+          before giving up - a very large account's first full sync can
+          still take a long time even with that working correctly.
+    """
+
+    MAX_REQUESTS_PER_SECOND = 18
+    MAX_REQUESTS_PER_2MIN = 95
+    MAX_RETRIES = 5
+
+    def __init__(self, api_key, continent):
+        self.api_key = api_key
+        self.continent = continent
+        self._request_times = []  # rolling log of request timestamps, for throttling
+
+    def _throttle(self):
+        now = time.monotonic()
+        self._request_times = [t for t in self._request_times if now - t < 120]
+        while len(self._request_times) >= self.MAX_REQUESTS_PER_2MIN:
+            time.sleep(0.25)
+            now = time.monotonic()
+            self._request_times = [t for t in self._request_times if now - t < 120]
+        recent = [t for t in self._request_times if now - t < 1]
+        if len(recent) >= self.MAX_REQUESTS_PER_SECOND:
+            time.sleep(max(0.0, 1 - (now - recent[0])))
+        self._request_times.append(time.monotonic())
+
+    def get_json(self, path, params=None):
+        query = f"?{urlencode(params)}" if params else ""
+        url = f"https://{self.continent}.api.riotgames.com{path}{query}"
+        # Riot's API sits behind Cloudflare, which has been confirmed (via
+        # a Cloudflare "error code: 1010" block) to reject urllib's default
+        # "Python-urllib/x.y" User-Agent outright as bot traffic - any
+        # other value works, so set a plain descriptive one.
+        req = Request(url, headers={"X-Riot-Token": self.api_key, "User-Agent": "lol-skins-script/1.0"})
+
+        for _attempt in range(self.MAX_RETRIES):
+            self._throttle()
+            try:
+                with urlopen(req) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except HTTPError as e:
+                if e.code == 429:
+                    try:
+                        # Spec also allows an HTTP-date here, which int()
+                        # can't parse - fall back to a flat 2s in that case.
+                        retry_after = int(e.headers.get("Retry-After", "2"))
+                    except (TypeError, ValueError):
+                        retry_after = 2
+                    print(f"  Riot API rate limit hit, waiting {retry_after}s...", file=sys.stderr)
+                    time.sleep(retry_after)
+                    continue
+                if e.code in (401, 403):
+                    raise RiotApiError(
+                        "Riot API key rejected (expired or invalid) - generate a "
+                        f"fresh one at {RIOT_DEV_PORTAL_URL} and pass it via "
+                        "--riot-api-key."
+                    ) from e
+                if e.code == 404:
+                    return None
+                if e.code in (500, 502, 503, 504):
+                    # Transient server-side error - worth a retry rather than
+                    # aborting a long sync over one bad request.
+                    print(f"  Riot API returned HTTP {e.code}, retrying...", file=sys.stderr)
+                    time.sleep(2)
+                    continue
+                # Anything else (unexpected status code): give up on this
+                # request, but as RiotApiError so callers can still fall
+                # back to the local client instead of crashing outright.
+                raise RiotApiError(f"Riot API request failed: HTTP {e.code} for {path}") from e
+            except URLError as e:
+                # Dropped connection, DNS blip, etc. - also worth a retry
+                # over thousands of requests in a long first sync.
+                print(f"  Riot API network error ({e.reason}), retrying...", file=sys.stderr)
+                time.sleep(2)
+                continue
+        raise RiotApiError("Riot API retries exhausted (rate limit or network issues) - try again later.")
+
+
+def fetch_riot_puuid(riot_api, game_name, tag_line):
+    """Resolve a Riot ID (gameName#tagLine) to the real account-wide puuid
+    Riot's public API expects.
+
+    This is NOT the same value as the "puuid" field on the LCU's
+    current-summoner response - that one is a 36-character locally-scoped
+    identifier, confirmed (via a "Bad Request - Exception decrypting ..."
+    400 from match-v5) to be unusable with the public API, which expects a
+    much longer (~78-char) opaque string. This is the one source of truth
+    for that.
+    """
+    resp = riot_api.get_json(f"/riot/account/v1/accounts/by-riot-id/{quote(game_name)}/{quote(tag_line)}")
+    if not resp or not resp.get("puuid"):
+        raise RiotApiError(
+            f"Couldn't resolve a Riot API puuid for {game_name}#{tag_line} via "
+            "account-v1 - double check the Riot ID is correct."
+        )
+    return resp["puuid"]
+
+
+def _load_match_cache(cache_path):
+    if not cache_path.exists():
+        return {}
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_match_cache(cache_path, cache):
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+
+
+def _summarize_match(match, puuid):
+    """Pull just the fields this script needs out of one full match-v5
+    match payload, for the local player identified by puuid."""
+    info = match.get("info") or {}
+    for p in info.get("participants") or []:
+        if p.get("puuid") == puuid:
+            return {
+                "championId": p.get("championId"),
+                "win": bool(p.get("win")),
+                "queueId": info.get("queueId"),
+            }
+    return None
+
+
+def fetch_full_match_history(riot_api, puuid, cache_path, max_matches=10000):
+    """Return (games-played Counter, wins Counter, total games counted),
+    each Counter keyed by championId - same shape as fetch_match_history(),
+    but sourced from Riot's match-v5 API instead of the local client.
+
+    Caches one compact record per match on disk (keyed by match id) so a
+    repeat run only has to fetch matches it hasn't seen before: match ids
+    come back most-recent-first, so once a whole page of ids is already in
+    the cache, everything older must be too, and paging stops there.
+    A fresh account (empty cache) instead pages all the way to Riot's
+    actual end of history (an empty ids page) or the max_matches safety
+    cap, whichever comes first - that first run can be slow (one request
+    per previously-unseen match) but every run after it is fast.
+    """
+    cache = _load_match_cache(cache_path)
+    page_size = 100
+    start = 0
+    new_matches = 0
+
+    while start < max_matches:
+        match_ids = riot_api.get_json(
+            f"/lol/match/v5/matches/by-puuid/{puuid}/ids",
+            params={"start": start, "count": page_size},
+        )
+        if not match_ids:
+            break
+
+        page_all_cached = True
+        for match_id in match_ids:
+            if match_id in cache:
+                continue
+            page_all_cached = False
+            match = riot_api.get_json(f"/lol/match/v5/matches/{match_id}")
+            if match is None:
+                continue
+            record = _summarize_match(match, puuid)
+            if record is not None:
+                cache[match_id] = record
+                new_matches += 1
+                if new_matches % 50 == 0:
+                    print(f"  ...fetched {new_matches} new match(es) so far", file=sys.stderr)
+                if new_matches % 200 == 0:
+                    _save_match_cache(cache_path, cache)  # checkpoint a long first sync
+
+        if page_all_cached:
+            break  # everything on this page (and so everything older) was already cached
+        if len(match_ids) < page_size:
+            break
+        start += page_size
+
+    if new_matches:
+        _save_match_cache(cache_path, cache)
+        print(f"Cached {new_matches} new match(es) ({len(cache)} total cached).")
+    else:
+        print(f"No new matches since last run - using {len(cache)} cached match(es).")
+
+    champion_counts = Counter()
+    champion_wins = Counter()
+    for record in cache.values():
+        if record.get("queueId") == 0:
+            continue  # custom/practice-tool games - same reasoning as fetch_match_history()
+        champ_id = record.get("championId")
+        if champ_id is None:
+            continue
+        champion_counts[champ_id] += 1
+        if record.get("win"):
+            champion_wins[champ_id] += 1
+
+    return champion_counts, champion_wins, sum(champion_counts.values())
 
 
 def _find_participant(game, puuid):
@@ -345,10 +626,39 @@ def main():
     )
     parser.add_argument("--out", default="lol-skins.html", help="output HTML path")
     parser.add_argument("--no-open", action="store_true", help="don't auto-open the result")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--riot-api-key", default=None,
+        help="REQUIRED. Riot developer API key, for full match history beyond "
+             "the local client's ~200-game ceiling. Get one (free, valid ~24h) "
+             "from https://developer.riotgames.com/",
+    )
+    parser.add_argument(
+        "--cache-dir", default="match_cache",
+        help="directory to cache full match history in (one file per account, "
+             "named by puuid)",
+    )
+    argv = sys.argv[1:]
+    # Shorthand: a single bare argument (e.g. `python lol-skins.py
+    # RGAPI-xxxx`) is treated as the API key - that's the overwhelmingly
+    # common thing anyone passes here, so don't make --riot-api-key
+    # mandatory boilerplate for the common case.
+    if len(argv) == 1 and not argv[0].startswith("-"):
+        argv = ["--riot-api-key", argv[0]]
+    args = parser.parse_args(argv)
+
+    if not args.riot_api_key:
+        print(f"No --riot-api-key given - opening {RIOT_DEV_PORTAL_URL} so you can grab one...", flush=True)
+        webbrowser.open(RIOT_DEV_PORTAL_URL)
+        parser.error(
+            "--riot-api-key is required. Get a free key (valid ~24h) from "
+            f"{RIOT_DEV_PORTAL_URL} (log in, then copy the "
+            "\"Development API Key\" on your dashboard) and pass it as:\n"
+            "  python lol-skins.py --riot-api-key RGAPI-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        )
+    riot_api_key = args.riot_api_key
 
     print("Finding League Client...")
-    port, token = find_client()
+    port, token, region = find_client()
     lcu = Lcu(port, token)
 
     print("Reading current summoner...")
@@ -434,11 +744,61 @@ def main():
                 file=sys.stderr,
             )
 
-    print("Reading match history...")
-    champion_play_counts, champion_win_counts, total_games_played = fetch_match_history(lcu, puuid)
+    champion_play_counts = champion_win_counts = None
+
+    if riot_api_key:
+        # Prefer the client's own "--region=" launch flag (full platform
+        # id, e.g. "NA1") - only fall back to the LCU's region-locale
+        # endpoint (shorter codes, e.g. "NA") if that flag wasn't present.
+        platform = region
+        continent = PLATFORM_TO_CONTINENT.get((platform or "").upper())
+        if not continent:
+            platform = fetch_region_locale(lcu)
+            continent = SHORT_REGION_TO_CONTINENT.get((platform or "").upper())
+        if not continent:
+            print(
+                f"WARNING: couldn't map platform/region '{region}'/'{platform}' to a "
+                "Riot API continent - falling back to the local client's match "
+                "history instead.",
+                file=sys.stderr,
+            )
+        elif not summoner.get("gameName"):
+            print(
+                "WARNING: no Riot ID (gameName#tagLine) on this account, needed to "
+                "resolve the Riot API puuid - falling back to the local client's "
+                "match history instead.",
+                file=sys.stderr,
+            )
+        else:
+            riot_api = RiotApi(riot_api_key, continent)
+            try:
+                # The LCU's own "puuid" field on current-summoner is NOT the
+                # same puuid the public Riot API expects (confirmed: the
+                # LCU one is a 36-char local identifier, the real one is a
+                # ~78-char opaque string) - resolve the real one via the
+                # Riot ID instead.
+                riot_puuid = fetch_riot_puuid(riot_api, summoner["gameName"], summoner["tagLine"])
+            except RiotApiError as e:
+                print(f"WARNING: {e}", file=sys.stderr)
+                print("Falling back to the local client's match history instead.", file=sys.stderr)
+            else:
+                print(f"Reading full match history via Riot API ({platform} -> {continent})...")
+                cache_path = Path(args.cache_dir) / f"{riot_puuid}.json"
+                try:
+                    champion_play_counts, champion_win_counts, total_games_played = (
+                        fetch_full_match_history(riot_api, riot_puuid, cache_path)
+                    )
+                except RiotApiError as e:
+                    print(f"WARNING: {e}", file=sys.stderr)
+                    print("Falling back to the local client's match history instead.", file=sys.stderr)
+
+    if champion_play_counts is None:
+        print("Reading match history (local client only, ~200 game ceiling)...")
+        champion_play_counts, champion_win_counts, total_games_played = fetch_match_history(lcu, puuid)
+
     if not total_games_played:
         print(
-            "WARNING: no match history found via the client - play rate/win rate won't be shown.",
+            "WARNING: no match history found - play rate/win rate won't be shown.",
             file=sys.stderr,
         )
     play_rate_by_champ = {
