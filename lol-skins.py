@@ -125,7 +125,7 @@ def build_html(display_name, sections, total_skins, total_shards, total_champs):
   .count {{ color:#9aa0a6; font-weight:normal; font-size:15px; }}
   .grid {{ display:flex; flex-wrap:wrap; gap:16px; margin-top:12px; }}
   .card {{ width:260px; background:#151a24; border-radius:8px; overflow:hidden; text-align:center; padding-bottom:6px; border:2px solid #4ad9e0; }}
-  .card img {{ width:260px; height:153px; object-fit:cover; display:block; }}
+  .card img {{ width:260px; height:153px; object-fit:cover; display:block; cursor:zoom-in; }}
   .card.shard {{ background:transparent; border:2px dashed #888; opacity:0.7; }}
   .noimg {{ width:260px; height:153px; display:flex; align-items:center; justify-content:center; color:#666; font-size:11px; }}
   .name {{ font-size:12px; padding:6px 4px 2px 4px; }}
@@ -136,6 +136,8 @@ def build_html(display_name, sections, total_skins, total_shards, total_champs):
   #no-results {{ display:none; color:#9aa0a6; }}
   .shards-toggle {{ display:flex; align-items:center; gap:6px; margin-top:10px; font-size:13px; color:#9aa0a6; }}
   .shards-toggle input {{ margin:0; }}
+  #hover-preview {{ position:fixed; display:none; z-index:1000; pointer-events:none; }}
+  #hover-preview img {{ display:block; max-width:min(90vw, 900px); max-height:85vh; border-radius:10px; box-shadow:0 8px 32px rgba(0,0,0,0.6); border:2px solid #2a2f3a; }}
 </style>
 </head><body>
 <header>
@@ -146,6 +148,7 @@ def build_html(display_name, sections, total_skins, total_shards, total_champs):
 </header>
 <div id='no-results'>No matches.</div>
 {sections}
+<div id='hover-preview'><img alt=''></div>
 <script>
 function filterSkins() {{
   var query = document.getElementById('search').value.trim().toLowerCase();
@@ -168,6 +171,34 @@ function filterSkins() {{
   }});
   document.getElementById('no-results').style.display = anyVisible ? 'none' : 'block';
 }}
+
+(function() {{
+  var preview = document.getElementById('hover-preview');
+  var previewImg = preview.querySelector('img');
+  var pad = 20;
+
+  function position(e) {{
+    var w = preview.offsetWidth, h = preview.offsetHeight;
+    var x = e.clientX + pad;
+    var y = e.clientY + pad;
+    if (x + w > window.innerWidth) x = e.clientX - w - pad;
+    if (y + h > window.innerHeight) y = e.clientY - h - pad;
+    preview.style.left = Math.max(pad, x) + 'px';
+    preview.style.top = Math.max(pad, y) + 'px';
+  }}
+
+  document.querySelectorAll('.card img').forEach(function(img) {{
+    img.addEventListener('mouseenter', function(e) {{
+      previewImg.src = img.src;
+      preview.style.display = 'block';
+      position(e);
+    }});
+    img.addEventListener('mousemove', position);
+    img.addEventListener('mouseleave', function() {{
+      preview.style.display = 'none';
+    }});
+  }});
+}})();
 </script>
 </body></html>
 """
