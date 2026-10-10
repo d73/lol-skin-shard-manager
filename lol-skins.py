@@ -39,6 +39,20 @@ KNOWN WEAKNESSES (read before assuming this keeps working forever)
     - Skin shards are read from the loot API (type "CHAMPION_SKIN_RENTAL"),
       which is just as undocumented/unofficial as the rest of the LCU - if
       shard counts look wrong, check that type string first.
+    - Play Rate and Win Rate come from paging through the local
+      match-history API (fetch_match_history()), which has only ever been
+      observed to serve back ~200 games before returning an empty page,
+      regardless of how many games are actually on the account - this
+      looks like a hard ceiling on what the LCU caches locally, not
+      something this script can page past. Full career history would
+      require Riot's online Match-V5 API with a developer API key
+      instead, which this script intentionally does not use (it's
+      LCU-only, zero-setup by design). There's a 2000-game safety cap in
+      the code, but in practice the ~200-game server ceiling is hit first.
+      Win Rate additionally depends on a "win" field being present on the
+      local player's participant entry (checked both flattened and nested
+      under "stats") - if a client version drops that field, wins will
+      undercount to zero without any other symptom.
 """
 
 import argparse
@@ -49,6 +63,7 @@ import ssl
 import subprocess
 import sys
 import webbrowser
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -107,6 +122,121 @@ class Lcu:
             return resp.read()
 
 
+def _find_participant(game, puuid):
+    """Return the local player's participant entry from one match-history
+    game, or None if it can't be identified.
+
+    Three participant shapes have been observed in the wild for this
+    endpoint, checked in order of how common they are on a current client:
+      1. Modern payloads embed "puuid" directly on each participant.
+      2. Older payloads instead map participantId -> puuid via a separate
+         "participantIdentities" list.
+      3. Some responses pre-filter "participants" down to just the local
+         player (one entry) with no puuid field needed at all.
+    """
+    participants = game.get("participants") or []
+
+    for p in participants:
+        if p.get("puuid") == puuid:
+            return p
+
+    participant_id = None
+    for identity in game.get("participantIdentities") or []:
+        if (identity.get("player") or {}).get("puuid") == puuid:
+            participant_id = identity.get("participantId")
+            break
+    if participant_id is not None:
+        for p in participants:
+            if p.get("participantId") == participant_id:
+                return p
+
+    if len(participants) == 1:
+        return participants[0]
+
+    return None
+
+
+def fetch_match_history(lcu, puuid):
+    """Return (games-played Counter, wins Counter, total games counted),
+    each Counter keyed by championId.
+
+    Pages through /lol-match-history/v1/products/lol/{puuid}/matches, which
+    is undocumented/unofficial like the rest of the LCU - it only covers
+    whatever history this client has synced locally, not the account's
+    full career. In practice this has only ever been observed to serve
+    back ~200 games before returning an empty page, no matter how many
+    games are actually on the account - that looks like a hard ceiling on
+    the LCU's local cache, not something pagination can get around.
+    Pagination is driven off the server's own "gameIndexEnd" field rather
+    than assuming a fixed page size, since the client has been seen
+    silently clamping how many games it returns per request regardless of
+    the requested begIndex/endIndex range. Stops when the server returns
+    an empty page (real end of available history) or the max_games safety
+    cap below is hit, whichever comes first.
+    """
+    champion_counts = Counter()
+    champion_wins = Counter()
+    total_games = 0
+    page_size = 100
+    max_games = 2000  # hard cap: so a very long history doesn't hang the script
+    beg_index = 0
+
+    while beg_index < max_games:
+        end_index = beg_index + page_size - 1
+        try:
+            resp = lcu.get_json(
+                f"/lol-match-history/v1/products/lol/{puuid}/matches"
+                f"?begIndex={beg_index}&endIndex={end_index}"
+            )
+        except (URLError, HTTPError):
+            break
+
+        games_obj = (resp or {}).get("games") or {}
+        games = games_obj.get("games") or []
+        if not games:
+            break
+
+        for game in games:
+            # Custom games (queueId 0, incl. the practice tool) commonly
+            # have only bots as "participants" - the single-participant
+            # fallback in _find_participant can't tell a bot from the
+            # local player there, so skip these rather than risk
+            # attributing a bot's champion/result to you. They also aren't
+            # meaningful "games played" for a play-rate/win-rate stat.
+            if game.get("queueId") == 0:
+                continue
+            participant = _find_participant(game, puuid)
+            if participant is None:
+                continue
+            champ_id = participant.get("championId")
+            if champ_id is None:
+                continue
+            champion_counts[champ_id] += 1
+            total_games += 1
+            # "win" has been seen both flattened onto the participant
+            # directly and nested under a "stats" sub-object - check both.
+            win = participant.get("win")
+            if win is None:
+                win = (participant.get("stats") or {}).get("win")
+            if win:
+                champion_wins[champ_id] += 1
+
+        # Advance past whatever the server actually returned, not what we
+        # asked for - the client has been seen clamping each page well
+        # below the requested range (e.g. always ~20 games even when 100
+        # are requested), so a short page does NOT mean history ended.
+        # Only an empty page (handled above) means that.
+        last_index = games_obj.get("gameIndexEnd")
+        if last_index is None:
+            last_index = beg_index + len(games) - 1
+        next_beg_index = last_index + 1
+        if next_beg_index <= beg_index:
+            break  # server isn't advancing - bail instead of looping forever
+        beg_index = next_beg_index
+
+    return champion_counts, champion_wins, total_games
+
+
 def build_html(display_name, sections, total_skins, total_shards, total_champs):
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     shards_note = f" (+{total_shards} shard{'s' if total_shards != 1 else ''})" if total_shards else ""
@@ -123,6 +253,8 @@ def build_html(display_name, sections, total_skins, total_shards, total_champs):
   h2 a {{ color:#e6e6e6; text-decoration:none; }}
   h2 a:hover {{ text-decoration:underline; }}
   .count {{ color:#9aa0a6; font-weight:normal; font-size:15px; }}
+  .playrate {{ color:#9aa0a6; font-size:13px; margin:2px 0 0 0; }}
+  .winrate {{ color:#9aa0a6; font-size:13px; margin:2px 0 0 0; }}
   .grid {{ display:flex; flex-wrap:wrap; gap:16px; margin-top:12px; }}
   .card {{ width:260px; background:#151a24; border-radius:8px; overflow:hidden; text-align:center; padding-bottom:6px; border:2px solid #4ad9e0; }}
   .card img {{ width:260px; height:153px; object-fit:cover; display:block; cursor:zoom-in; }}
@@ -222,6 +354,7 @@ def main():
     print("Reading current summoner...")
     summoner = lcu.get_json("/lol-summoner/v1/current-summoner")
     summoner_id = summoner["summonerId"]
+    puuid = summoner.get("puuid", "")
     display_name = (
         f"{summoner['gameName']}#{summoner['tagLine']}"
         if summoner.get("gameName")
@@ -231,6 +364,9 @@ def main():
     print("Reading champion list...")
     champions = lcu.get_json(f"/lol-champions/v1/inventories/{summoner_id}/champions-minimal")
     champ_lookup = {c["id"]: c["name"] for c in champions}
+
+    def champ_name_for(champ_id):
+        return champ_lookup.get(champ_id, f"Unknown ({champ_id})")
 
     print("Reading skin inventory...")
     skins = lcu.get_json(f"/lol-champions/v1/inventories/{summoner_id}/skins-minimal")
@@ -298,16 +434,32 @@ def main():
                 file=sys.stderr,
             )
 
+    print("Reading match history...")
+    champion_play_counts, champion_win_counts, total_games_played = fetch_match_history(lcu, puuid)
+    if not total_games_played:
+        print(
+            "WARNING: no match history found via the client - play rate/win rate won't be shown.",
+            file=sys.stderr,
+        )
+    play_rate_by_champ = {
+        champ_name_for(champ_id): count
+        for champ_id, count in champion_play_counts.items()
+    }
+    win_rate_by_champ = {
+        champ_name_for(champ_id): count
+        for champ_id, count in champion_win_counts.items()
+    }
+
     print(f"Found {len(owned)} owned skin(s) and {len(shards)} shard(s). Downloading thumbnails...")
 
     by_champ = {}
     for skin in owned:
-        champ_name = champ_lookup.get(skin["championId"], f"Unknown ({skin['championId']})")
+        champ_name = champ_name_for(skin["championId"])
         by_champ.setdefault(champ_name, []).append(skin)
 
     by_champ_shards = {}
     for skin in shards:
-        champ_name = champ_lookup.get(skin["championId"], f"Unknown ({skin['championId']})")
+        champ_name = champ_name_for(skin["championId"])
         by_champ_shards.setdefault(champ_name, []).append(skin)
 
     def render_card(skin, is_shard):
@@ -383,10 +535,21 @@ def main():
         wiki_url = (
             f"https://wiki.leagueoflegends.com/en-us/{quote(champ_name.replace(' ', '_'))}/Cosmetics"
         )
+        games_played = play_rate_by_champ.get(champ_name, 0)
+        play_rate_html = ""
+        if total_games_played:
+            play_rate_html = (
+                f"<div class='playrate'>Play Rate: {games_played} / {total_games_played} games</div>"
+            )
+        win_rate_html = ""
+        if games_played:
+            wins = win_rate_by_champ.get(champ_name, 0)
+            win_rate_html = f"<div class='winrate'>Win Rate: {wins} / {games_played} games</div>"
         sections.append(
             f"<section data-champ='{champ_name.lower()}'>"
             f"<h2><a href='{wiki_url}' target='_blank' rel='noopener'>{champ_name}</a> "
             f"<span class='count'>({count_label})</span></h2>"
+            f"{play_rate_html}{win_rate_html}"
             f"<div class='grid'>{''.join(cards)}</div></section>"
         )
 
